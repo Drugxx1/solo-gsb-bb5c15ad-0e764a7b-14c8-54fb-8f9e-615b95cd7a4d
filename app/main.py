@@ -15,6 +15,11 @@ from .schemas import (
     CalculationResult,
     CalculationSummary,
     CapacityUpgradeResult,
+    CableAssignmentItem,
+    CableCutItem,
+    CableCuttingPreviewRequest,
+    CableCuttingPreviewResult,
+    CableReelPlanItem,
     DeviceAdditionPlanResult,
     DeviceAdditionRequest,
     FaultDisconnectedItem,
@@ -38,6 +43,8 @@ from .schemas import (
 )
 from .solver import (
     AdditionExistingDevice,
+    CableReel,
+    CableSegment,
     Device,
     FaultRehearsalDevice,
     PowerLogDevice,
@@ -46,6 +53,7 @@ from .solver import (
     ShiftDevice,
     StartupDevice,
     solve,
+    solve_cable_cutting_preview,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
@@ -97,6 +105,14 @@ _MESSAGE_REPLAY_CLEAN = "复盘完成：窗口内各相负载均未超过容量"
 _MESSAGE_REPLAY_ALERT = (
     "复盘完成：窗口内存在超容区间，已将连续超容段合并为告警"
 )
+_MESSAGE_CABLE_FEASIBLE = (
+    "预演成功：已在最小化启用盘数、再最小化启用盘总长度的目标下，"
+    "找到全部电缆段可裁出且盘编号序列字典序最小的裁切方案"
+)
+_MESSAGE_CABLE_INFEASIBLE = (
+    "无可行裁切方案：不存在每段电缆整体取自单个库存盘、"
+    "且同盘切口损耗后不超过盘长的裁切方案"
+)
 
 
 @asynccontextmanager
@@ -136,6 +152,13 @@ app = FastAPI(
         "至窗口终点的三相负载，将连续存在任一相超容的区间合并为告警，返回"
         "各段告警起止时刻、各相最大超额量与全窗口各相峰值"
         "（仅复盘，不修改历史记录）。"
+        "对已有可行分配且设备不超过 8 台的计算记录，还可做电缆盘裁切预演："
+        "逐台给出正整数电缆段长度（设备编号须与记录完全一致），并给出至多 8 个"
+        "编号唯一、长度为正整数的库存电缆盘与非负整数切割损耗；每段电缆不可"
+        "拼接，同盘裁出多段时占用长度为段长之和加相邻切口数乘切割损耗。"
+        "求全部电缆段均可裁出的方案，先最小化启用盘数，再最小化启用盘总长度，"
+        "最后取按设备编号排序的电缆盘编号序列字典序最小者，返回各盘裁切清单与"
+        "剩余长度（仅预演，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -777,4 +800,101 @@ def power_log_replay(
         alerts=alerts,
         peak_loads=Loads(**result.peak_loads),
         message=_MESSAGE_REPLAY_ALERT if alerts else _MESSAGE_REPLAY_CLEAN,
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/cable-cutting-preview",
+    response_model=CableCuttingPreviewResult,
+    tags=["calculations"],
+)
+def cable_cutting_preview(
+    calculation_id: int, payload: CableCuttingPreviewRequest
+) -> CableCuttingPreviewResult:
+    """电缆盘裁切预演：为设备不超过 8 台的可行记录规划库存盘裁切方案。
+
+    每台设备逐段给出正整数长度电缆，设备编号集合须与记录完全一致；
+    每段电缆不可拼接，只能整体取自一个库存盘。同一盘裁出 k 段时占用
+    长度为「各段长度之和 + (k-1) × 切割损耗」。在全部电缆段均可裁出
+    的前提下，目标依次为：启用盘数最少 → 启用盘总长度（盘长之和）
+    最小 → 按设备编号排序的电缆盘编号序列字典序最小。返回各段取盘
+    结果、各启用盘的裁切清单（按设备编号排序）、占用与剩余长度；
+    无可行方案时返回 ``feasible=false``。仅做预演，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配或设备超过 8 台返回 409；
+    电缆段设备编号与记录不一致返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法进行电缆盘裁切预演：id={calculation_id}",
+        )
+    if len(record["devices"]) > 8:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"电缆盘裁切预演仅支持设备不超过 8 台的计算记录："
+                f"id={calculation_id} 含 {len(record['devices'])} 台设备"
+            ),
+        )
+
+    record_ids = {d["device_id"] for d in record["devices"]}
+    segment_ids = {s.device_id for s in payload.segments}
+    if segment_ids != record_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="电缆段设备编号须与计算记录完全一致（不多不少）",
+        )
+
+    segments = [
+        CableSegment(code=s.device_id, length=s.length) for s in payload.segments
+    ]
+    reels = [CableReel(code=r.id, length=r.length) for r in payload.reels]
+    result = solve_cable_cutting_preview(segments, reels, payload.cut_loss)
+
+    assignments = (
+        [
+            CableAssignmentItem(device_id=code, reel_id=result.assignment[code])
+            for code in sorted(result.assignment)
+        ]
+        if result.feasible
+        else []
+    )
+    reel_plans = (
+        [
+            CableReelPlanItem(
+                reel_id=plan.reel_id,
+                reel_length=plan.reel_length,
+                cuts=[
+                    CableCutItem(device_id=cut.device_id, length=cut.length)
+                    for cut in plan.cuts
+                ],
+                used_length=plan.used_length,
+                remaining_length=plan.remaining_length,
+            )
+            for plan in result.reel_plans
+        ]
+        if result.feasible
+        else []
+    )
+    return CableCuttingPreviewResult(
+        id=record["id"],
+        created_at=record["created_at"],
+        cut_loss=payload.cut_loss,
+        feasible=result.feasible,
+        used_reel_count=result.used_reel_count,
+        used_reel_total_length=result.used_reel_total_length,
+        assignments=assignments,
+        reel_plans=reel_plans,
+        message=(
+            _MESSAGE_CABLE_FEASIBLE
+            if result.feasible
+            else _MESSAGE_CABLE_INFEASIBLE
+        ),
     )

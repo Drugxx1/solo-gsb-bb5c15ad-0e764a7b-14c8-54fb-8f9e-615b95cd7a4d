@@ -7,6 +7,8 @@ import unittest
 from app.solver import (
     SLOTS,
     AdditionExistingDevice,
+    CableReel,
+    CableSegment,
     Device,
     FaultRehearsalDevice,
     PowerLogDevice,
@@ -15,6 +17,7 @@ from app.solver import (
     ShiftDevice,
     StartupDevice,
     solve,
+    solve_cable_cutting_preview,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
@@ -1985,6 +1988,266 @@ class PowerLogReplayFuzzTest(unittest.TestCase):
             self.assertEqual(
                 actual_alerts, expected_alerts, f"case {case}: 告警不符"
             )
+
+
+# ---------------------------------------------------------------------------
+# 电缆盘裁切预演
+# ---------------------------------------------------------------------------
+
+
+def brute_force_cable(segments, reels, cut_loss):
+    """电缆裁切的朴素全枚举：返回最优目标键 (盘数, 盘总长, 盘编号序列)。"""
+    segs = sorted(segments, key=lambda s: s.code)
+    reels_list = sorted(reels, key=lambda r: r.code)
+    options = [range(len(reels_list)) for _ in segs]
+    best = None
+    for combo in itertools.product(*options):
+        usage = {}
+        for i, j in enumerate(combo):
+            usage.setdefault(j, []).append(i)
+        ok = True
+        for j, idxs in usage.items():
+            used = (
+                sum(segs[i].length for i in idxs) + (len(idxs) - 1) * cut_loss
+            )
+            if used > reels_list[j].length:
+                ok = False
+                break
+        if not ok:
+            continue
+        key = (
+            len(usage),
+            sum(reels_list[j].length for j in usage),
+            tuple(reels_list[j].code for j in combo),
+        )
+        if best is None or key < best:
+            best = key
+    return best
+
+
+class CableCuttingPreviewTest(unittest.TestCase):
+    def test_single_segment_single_reel(self):
+        result = solve_cable_cutting_preview(
+            [CableSegment("X", 7)], [CableReel("R", 9)], 3
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.used_reel_count, 1)
+        self.assertEqual(result.used_reel_total_length, 9)
+        self.assertEqual(result.assignment, {"X": "R"})
+        plan = result.reel_plans[0]
+        self.assertEqual(plan.reel_id, "R")
+        self.assertEqual(len(plan.cuts), 1)
+        # 单段不产生相邻切口损耗
+        self.assertEqual(plan.used_length, 7)
+        self.assertEqual(plan.remaining_length, 2)
+
+    def test_cut_loss_between_adjacent_cuts(self):
+        # 两段 5、盘长 10：损耗 0 时一盘可裁（占用 10）；损耗 1 时占用 11，
+        # 一盘放不下，须启用两盘
+        reels = [CableReel("R1", 10), CableReel("R2", 10)]
+        segments = [CableSegment("A", 5), CableSegment("B", 5)]
+        no_loss = solve_cable_cutting_preview(segments, reels, 0)
+        self.assertEqual(no_loss.used_reel_count, 1)
+        self.assertEqual(no_loss.reel_plans[0].used_length, 10)
+        self.assertEqual(no_loss.reel_plans[0].remaining_length, 0)
+        with_loss = solve_cable_cutting_preview(segments, reels, 1)
+        self.assertEqual(with_loss.used_reel_count, 2)
+        for plan in with_loss.reel_plans:
+            self.assertEqual(plan.used_length, 5)
+            self.assertEqual(plan.remaining_length, 5)
+
+    def test_minimize_reel_count_before_total_length(self):
+        # 4,4 两段：一盘 R1(8) 即可（盘数 1、总长 8），优于两盘 R2/R3（盘数 2）
+        result = solve_cable_cutting_preview(
+            [CableSegment("D1", 4), CableSegment("D2", 4)],
+            [CableReel("R1", 8), CableReel("R2", 5), CableReel("R3", 5)],
+            0,
+        )
+        self.assertEqual(result.used_reel_count, 1)
+        self.assertEqual(result.used_reel_total_length, 8)
+        self.assertEqual(result.assignment, {"D1": "R1", "D2": "R1"})
+
+    def test_minimize_total_length_on_equal_count(self):
+        # 段 6,5,4、损耗 1：两盘可行时取总长最小的 {RA(10), RB(6)}（总长 16），
+        # 而非 {RA, RC}（总长 20）；RB 恰好放 D1(6)，RA 放 D2(5)+切口+D3(4)=10
+        result = solve_cable_cutting_preview(
+            [CableSegment("D1", 6), CableSegment("D2", 5), CableSegment("D3", 4)],
+            [CableReel("RA", 10), CableReel("RB", 6), CableReel("RC", 10)],
+            1,
+        )
+        self.assertEqual(result.used_reel_count, 2)
+        self.assertEqual(result.used_reel_total_length, 16)
+        self.assertEqual(result.assignment, {"D1": "RB", "D2": "RA", "D3": "RA"})
+        plans = {p.reel_id: p for p in result.reel_plans}
+        self.assertEqual(
+            [(c.device_id, c.length) for c in plans["RA"].cuts],
+            [("D2", 5), ("D3", 4)],
+        )
+        self.assertEqual(plans["RA"].used_length, 10)
+        self.assertEqual(plans["RA"].remaining_length, 0)
+
+    def test_lex_tie_break_across_reel_subsets(self):
+        # 段 D1=10,D2=3：子集 {RA,RB} 与 {RA,RC} 的盘数、总长均相同；
+        # 各自字典序最小序列分别为 (RB,RA) 与 (RC,RA)，RB<RC 故取前者——
+        # 即使两个子集都含编号最小的 RA，也不能只按子集编号元组判定。
+        result = solve_cable_cutting_preview(
+            [CableSegment("D1", 10), CableSegment("D2", 3)],
+            [CableReel("RA", 3), CableReel("RB", 10), CableReel("RC", 10)],
+            0,
+        )
+        self.assertEqual(result.assignment, {"D1": "RB", "D2": "RA"})
+        self.assertEqual(
+            sorted(p.reel_id for p in result.reel_plans), ["RA", "RB"]
+        )
+
+    def test_lex_tie_break_within_one_subset(self):
+        # 段 4,3,3、盘 RA=7,RB=7：两盘可行；序列字典序最小要求尽量把前段
+        # 压到 RA：D1+D2=7 入 RA，D3 入 RB => (RA,RA,RB)
+        result = solve_cable_cutting_preview(
+            [
+                CableSegment("D1", 4),
+                CableSegment("D2", 3),
+                CableSegment("D3", 3),
+            ],
+            [CableReel("RA", 7), CableReel("RB", 7)],
+            0,
+        )
+        self.assertEqual(
+            result.assignment,
+            {"D1": "RA", "D2": "RA", "D3": "RB"},
+        )
+
+    def test_prefix_fit_is_checked_against_suffix_completion(self):
+        # 段 4,4,6,6；盘 RA=RB=10，损耗 0。直放贪心会把 D1,D2 先压入 RA
+        # （占用 8），随后 D3 只能入 RB、D4 无处可放；字典序最小可行方案
+        # 须回退为 D1 入 RA、D2 入 RB、D3 回 RA（4+6=10）、D4 回 RB。
+        result = solve_cable_cutting_preview(
+            [
+                CableSegment("D1", 4),
+                CableSegment("D2", 4),
+                CableSegment("D3", 6),
+                CableSegment("D4", 6),
+            ],
+            [CableReel("RA", 10), CableReel("RB", 10)],
+            0,
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.used_reel_count, 2)
+        self.assertEqual(result.used_reel_total_length, 20)
+        self.assertEqual(
+            result.assignment,
+            {"D1": "RA", "D2": "RB", "D3": "RA", "D4": "RB"},
+        )
+        for plan in result.reel_plans:
+            self.assertEqual(plan.used_length, 10)
+            self.assertEqual(plan.remaining_length, 0)
+
+    def test_infeasible_segment_longer_than_every_reel(self):
+        result = solve_cable_cutting_preview(
+            [CableSegment("D1", 10)], [CableReel("R1", 9)], 0
+        )
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.assignment)
+        self.assertIsNone(result.reel_plans)
+        self.assertIsNone(result.used_reel_count)
+        self.assertIsNone(result.used_reel_total_length)
+
+    def test_infeasible_by_capacity(self):
+        # 三段 6 但只有两个容量 6 的盘：无解
+        result = solve_cable_cutting_preview(
+            [CableSegment(f"D{i}", 6) for i in range(1, 4)],
+            [CableReel("R1", 6), CableReel("R2", 6)],
+            0,
+        )
+        self.assertFalse(result.feasible)
+
+    def test_device_ids_sorted_as_strings(self):
+        # 编号按字符串排序：DEV-1 < DEV-10 < DEV-2
+        result = solve_cable_cutting_preview(
+            [
+                CableSegment("DEV-2", 4),
+                CableSegment("DEV-10", 4),
+                CableSegment("DEV-1", 4),
+            ],
+            [CableReel("RA", 8), CableReel("RB", 8)],
+            0,
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(
+            result.assignment,
+            {"DEV-1": "RA", "DEV-10": "RA", "DEV-2": "RB"},
+        )
+
+    def test_cut_loss_makes_shorter_subset_better(self):
+        # 段 5,5,5；盘 R1=12,R2=12,R3=12，损耗 3：一盘最多一段
+        # （5+3+5=13>12），故须三盘
+        result = solve_cable_cutting_preview(
+            [CableSegment(f"D{i}", 5) for i in range(1, 4)],
+            [CableReel("R1", 12), CableReel("R2", 12), CableReel("R3", 12)],
+            3,
+        )
+        self.assertEqual(result.used_reel_count, 3)
+        self.assertEqual(result.used_reel_total_length, 36)
+        self.assertEqual(
+            tuple(result.assignment[f"D{i}"] for i in range(1, 4)),
+            ("R1", "R2", "R3"),
+        )
+
+
+class CableCuttingPreviewFuzzTest(unittest.TestCase):
+    """裁切求解与朴素全枚举（段数 ≤ 5、盘数 ≤ 5）做随机对拍。"""
+
+    def test_against_brute_force(self):
+        rng = random.Random(20260926)
+        for _ in range(800):
+            n = rng.randint(1, 5)
+            m = rng.randint(1, 5)
+            segments = [
+                CableSegment(f"D{i+1}", rng.randint(1, 8)) for i in range(n)
+            ]
+            reels = [
+                CableReel(f"R{i+1}", rng.randint(2, 12)) for i in range(m)
+            ]
+            cut_loss = rng.randint(0, 3)
+            expected = brute_force_cable(segments, reels, cut_loss)
+            result = solve_cable_cutting_preview(segments, reels, cut_loss)
+            if expected is None:
+                self.assertFalse(result.feasible)
+                continue
+            self.assertTrue(result.feasible)
+            ordered = sorted(segments, key=lambda s: s.code)
+            got = (
+                result.used_reel_count,
+                result.used_reel_total_length,
+                tuple(result.assignment[s.code] for s in ordered),
+            )
+            self.assertEqual(got, expected)
+            # 每个启用盘非空，占用 / 剩余长度自洽
+            used_reel_ids = set()
+            for plan in result.reel_plans:
+                self.assertGreaterEqual(len(plan.cuts), 1)
+                k = len(plan.cuts)
+                expected_used = (
+                    sum(c.length for c in plan.cuts) + (k - 1) * cut_loss
+                )
+                self.assertEqual(plan.used_length, expected_used)
+                self.assertEqual(
+                    plan.remaining_length, plan.reel_length - expected_used
+                )
+                self.assertGreaterEqual(plan.remaining_length, 0)
+                used_reel_ids.add(plan.reel_id)
+            self.assertEqual(used_reel_ids, set(result.assignment.values()))
+
+    def test_eight_by_eight_performance(self):
+        # 8 段 8 盘的规模上限须快速完成
+        segments = [
+            CableSegment(code, length)
+            for code, length in zip("ABCDEFGH", [6, 6, 5, 5, 4, 4, 3, 3])
+        ]
+        reels = [CableReel(f"R{i}", 10) for i in range(1, 9)]
+        result = solve_cable_cutting_preview(segments, reels, 2)
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.used_reel_count, 5)
 
 
 if __name__ == "__main__":

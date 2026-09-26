@@ -1498,3 +1498,285 @@ def test_power_log_replay_does_not_modify_record():
         json=_replay_body(events),
     ).json()
     assert again == resp.json()
+
+
+# ---------------------------------------------------------------------------
+# 电缆盘裁切预演
+# ---------------------------------------------------------------------------
+
+
+def _create_cable_record(device_count=3):
+    """创建一条可行计算记录（D1..Dn 均分三相，容量充裕），返回记录 id。"""
+    phases = ["A", "B", "C"]
+    payload = {
+        "capacities": {"A": 1000, "B": 1000, "C": 1000},
+        "devices": [
+            {
+                "id": f"D{i + 1}",
+                "power": 10,
+                "allowed_phases": [phases[i % 3]],
+            }
+            for i in range(device_count)
+        ],
+    }
+    resp = client.post("/api/v1/calculations", json=payload)
+    assert resp.status_code == 201 and resp.json()["feasible"]
+    return resp.json()["id"]
+
+
+def _cable_body(segments, reels, cut_loss=0):
+    return {
+        "cut_loss": cut_loss,
+        "segments": [
+            {"device_id": device_id, "length": length}
+            for device_id, length in segments
+        ],
+        "reels": [{"id": rid, "length": length} for rid, length in reels],
+    }
+
+
+def test_cable_cutting_preview_feasible():
+    calc_id = _create_cable_record(3)
+    body = _cable_body(
+        segments=[("D1", 6), ("D2", 5), ("D3", 4)],
+        reels=[("RA", 10), ("RB", 6), ("RC", 10)],
+        cut_loss=1,
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feasible"] is True
+    assert data["cut_loss"] == 1
+    assert data["used_reel_count"] == 2
+    assert data["used_reel_total_length"] == 16
+    assert data["assignments"] == [
+        {"device_id": "D1", "reel_id": "RB"},
+        {"device_id": "D2", "reel_id": "RA"},
+        {"device_id": "D3", "reel_id": "RA"},
+    ]
+    plans = {p["reel_id"]: p for p in data["reel_plans"]}
+    # RA 裁 5+切口损耗 1+4=10，剩余 0
+    assert plans["RA"]["cuts"] == [
+        {"device_id": "D2", "length": 5},
+        {"device_id": "D3", "length": 4},
+    ]
+    assert plans["RA"]["used_length"] == 10
+    assert plans["RA"]["remaining_length"] == 0
+    # RB 单段 6，不产生切口损耗，剩余 0
+    assert plans["RB"]["cuts"] == [{"device_id": "D1", "length": 6}]
+    assert plans["RB"]["used_length"] == 6
+    assert plans["RB"]["remaining_length"] == 0
+    assert "预演成功" in data["message"]
+
+
+def test_cable_cutting_preview_single_segment_no_cut_loss():
+    calc_id = _create_cable_record(1)
+    body = _cable_body(segments=[("D1", 7)], reels=[("R1", 9)], cut_loss=3)
+    data = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    ).json()
+    assert data["feasible"] is True
+    plan = data["reel_plans"][0]
+    assert plan["used_length"] == 7  # 单段无相邻切口
+    assert plan["remaining_length"] == 2
+
+
+def test_cable_cutting_preview_infeasible():
+    calc_id = _create_cable_record(3)
+    # 每段 6，仅两个容量 6 的盘：三段无法裁出
+    body = _cable_body(
+        segments=[("D1", 6), ("D2", 6), ("D3", 6)],
+        reels=[("R1", 6), ("R2", 6)],
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feasible"] is False
+    assert data["used_reel_count"] is None
+    assert data["used_reel_total_length"] is None
+    assert data["assignments"] == []
+    assert data["reel_plans"] == []
+    assert "无可行裁切方案" in data["message"]
+
+
+def test_cable_cutting_preview_404():
+    body = _cable_body(segments=[("D1", 1)], reels=[("R1", 1)])
+    resp = client.post(
+        "/api/v1/calculations/999999/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 404
+
+
+def test_cable_cutting_preview_409_record_infeasible():
+    payload = {
+        "capacities": {"A": 1, "B": 0, "C": 0},
+        "devices": [{"id": "X", "power": 5, "allowed_phases": ["A"]}],
+    }
+    calc_id = client.post("/api/v1/calculations", json=payload).json()["id"]
+    body = _cable_body(segments=[("X", 1)], reels=[("R1", 1)])
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 409
+
+
+def test_cable_cutting_preview_409_too_many_devices():
+    # 9 台设备的可行记录超出「不超过 8 台」的预演适用范围
+    calc_id = _create_cable_record(9)
+    body = _cable_body(
+        segments=[(f"D{i + 1}", 1) for i in range(9)],
+        reels=[("R1", 100)],
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 409
+    assert "8 台" in resp.json()["detail"]
+
+
+def test_cable_cutting_preview_422_segment_ids_mismatch():
+    calc_id = _create_cable_record(3)
+    # 多出未知设备
+    body = _cable_body(
+        segments=[("D1", 1), ("D2", 1), ("GHOST", 1)],
+        reels=[("R1", 10)],
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 422
+    assert "完全一致" in resp.json()["detail"]
+    # 缺少设备
+    body = _cable_body(segments=[("D1", 1), ("D2", 1)], reels=[("R1", 10)])
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+        ).status_code
+        == 422
+    )
+
+
+def test_cable_cutting_preview_422_validation_rules():
+    calc_id = _create_cable_record(3)
+    base = _cable_body(
+        segments=[("D1", 1), ("D2", 1), ("D3", 1)], reels=[("R1", 10)]
+    )
+    # 段长非正整数
+    bad = {**base, "segments": [{"device_id": "D1", "length": 0}]}
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=bad
+        ).status_code
+        == 422
+    )
+    # 切割损耗为负
+    bad = {**base, "cut_loss": -1}
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=bad
+        ).status_code
+        == 422
+    )
+    # 电缆段设备编号重复
+    bad = {
+        **base,
+        "segments": [
+            {"device_id": "D1", "length": 1},
+            {"device_id": "D1", "length": 1},
+            {"device_id": "D3", "length": 1},
+        ],
+    }
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=bad
+        ).status_code
+        == 422
+    )
+    # 电缆盘编号重复
+    bad = {
+        **base,
+        "reels": [{"id": "R1", "length": 10}, {"id": "R1", "length": 5}],
+    }
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=bad
+        ).status_code
+        == 422
+    )
+    # 盘长非正整数
+    bad = {**base, "reels": [{"id": "R1", "length": 0}]}
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=bad
+        ).status_code
+        == 422
+    )
+    # 空电缆盘列表 / 空电缆段列表
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview",
+            json={**base, "reels": []},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            f"/api/v1/calculations/{calc_id}/cable-cutting-preview",
+            json={**base, "segments": []},
+        ).status_code
+        == 422
+    )
+
+
+def test_cable_cutting_preview_422_too_many_reels():
+    calc_id = _create_cable_record(1)
+    body = _cable_body(
+        segments=[("D1", 1)],
+        reels=[(f"R{i}", 10) for i in range(9)],  # 至多 8 个库存盘
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 422
+
+
+def test_cable_cutting_preview_eight_devices_supported():
+    calc_id = _create_cable_record(8)
+    body = _cable_body(
+        segments=[(f"D{i + 1}", 1) for i in range(8)],
+        reels=[("BIG", 8)],
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feasible"] is True
+    assert data["used_reel_count"] == 1
+
+
+def test_cable_cutting_preview_does_not_modify_record():
+    calc_id = _create_cable_record(3)
+    before = client.get(f"/api/v1/calculations/{calc_id}").json()
+    count_before = len(client.get("/api/v1/calculations").json())
+    body = _cable_body(
+        segments=[("D1", 6), ("D2", 5), ("D3", 4)],
+        reels=[("RA", 10), ("RB", 6), ("RC", 10)],
+        cut_loss=1,
+    )
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    )
+    assert resp.status_code == 200
+    # 预演不改历史：原记录内容与记录总数均不变
+    assert client.get(f"/api/v1/calculations/{calc_id}").json() == before
+    assert len(client.get("/api/v1/calculations").json()) == count_before
+    # 同一输入结果确定（幂等读操作）
+    again = client.post(
+        f"/api/v1/calculations/{calc_id}/cable-cutting-preview", json=body
+    ).json()
+    assert again == resp.json()
