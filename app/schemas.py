@@ -499,3 +499,93 @@ class PowerLogReplayResult(BaseModel):
     )
     peak_loads: Loads = Field(..., description="全窗口各相峰值负载")
     message: str
+
+
+class CableSegmentIn(BaseModel):
+    """单台设备所需的一整段电缆（不可拼接）。"""
+
+    device_id: str = Field(
+        ..., min_length=1, max_length=64, description="设备编号，须与计算记录一致"
+    )
+    length: int = Field(..., gt=0, description="该设备所需电缆段长度（正整数）")
+
+
+class CableReelIn(BaseModel):
+    """一个库存电缆盘。"""
+
+    id: str = Field(..., min_length=1, max_length=64, description="电缆盘唯一编号")
+    length: int = Field(..., gt=0, description="电缆盘长度（正整数）")
+
+
+class CableCuttingRequest(BaseModel):
+    """电缆盘裁切预演请求体（仅预演，不修改历史计算记录）。"""
+
+    segments: list[CableSegmentIn] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description="逐台设备给出的电缆段长度，设备编号须与记录完全一致（1~8 段）",
+    )
+    reels: list[CableReelIn] = Field(
+        ...,
+        max_length=8,
+        description="库存电缆盘，0~8 个，编号唯一、长度为正整数；无盘时无解",
+    )
+    cut_loss: int = Field(
+        ..., ge=0, description="同一盘上每个相邻切口的切割损耗（非负整数）"
+    )
+
+    @model_validator(mode="after")
+    def _unique_ids(self) -> "CableCuttingRequest":
+        segment_ids = [s.device_id for s in self.segments]
+        if len(segment_ids) != len(set(segment_ids)):
+            raise ValueError("电缆段的设备编号必须唯一")
+        reel_ids = [r.id for r in self.reels]
+        if len(reel_ids) != len(set(reel_ids)):
+            raise ValueError("电缆盘编号必须唯一")
+        return self
+
+
+class CableCutItem(BaseModel):
+    """某盘上裁给一台设备的一段电缆。"""
+
+    device_id: str = Field(..., description="设备编号")
+    length: int = Field(..., description="电缆段长度（正整数）")
+
+
+class CableReelPlanItem(BaseModel):
+    """单个启用盘的裁切清单。"""
+
+    reel_id: str = Field(..., description="电缆盘编号")
+    reel_length: int = Field(..., description="电缆盘原长度")
+    cuts: list[CableCutItem] = Field(
+        ..., description="本盘的裁切清单（按设备编号排序），每段电缆不可拼接"
+    )
+    occupied: int = Field(
+        ...,
+        description="占用长度 = 各段长度之和 +（段数 - 1）·切割损耗，不超过盘长",
+    )
+    remaining: int = Field(..., ge=0, description="剩余长度 = 盘长 - 占用长度")
+
+
+class CableCuttingResultResponse(BaseModel):
+    """电缆盘裁切预演结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    cut_loss: int = Field(..., ge=0, description="每个相邻切口的切割损耗")
+    feasible: bool = Field(..., description="是否存在可裁出全部电缆段的方案")
+    reel_count: Optional[int] = Field(
+        None, description="启用盘数（首要优化目标）；无解时为 null"
+    )
+    reel_total_length: Optional[int] = Field(
+        None, description="启用盘总长度（次要优化目标）；无解时为 null"
+    )
+    reel_sequence: list[str] = Field(
+        ...,
+        description="按设备编号排序后各设备所用电缆盘编号序列；无解时为空",
+    )
+    reel_plans: list[CableReelPlanItem] = Field(
+        ..., description="各启用盘的裁切清单与剩余长度（按电缆盘编号排序）；无解时为空"
+    )
+    message: str

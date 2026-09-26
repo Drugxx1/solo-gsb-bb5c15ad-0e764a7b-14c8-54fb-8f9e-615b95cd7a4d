@@ -91,6 +91,18 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 负载超过容量即超容；相邻超容段合并为一段告警，报告每段告警的起止时刻与
 各相最大超额量，以及全窗口各相峰值负载。事件数不超过 200，按时刻分组后
 一次顺序扫描即可完成。
+
+电缆盘裁切预演（solve_cable_cutting）：对设备不超过 8 台且已有可行分配的
+计算记录，逐台设备给出一段正整数长度电缆（不可拼接），另给至多 8 个编号唯一、
+长度为正整数的库存电缆盘与非负整数切割损耗。同一盘裁出 k 段时占用
+「段长之和 + (k-1)·损耗」。做权值变换 w=段长+损耗、容量 C=盘长+损耗后，
+占用约束等价于 Σw ≤ C，问题归约为「每个电缆段整体放入一个盘」的装箱：
+目标依次为 1) 启用盘数最少；2) 启用盘总长度最短；3) 按设备编号排序的
+电缆盘编号序列字典序最小。前两个目标用逐盘 0/1 背包式子集划分 DP 求最优
+（设备、盘均不超过 8，状态 2^8、单盘子集枚举总量 3^8，瞬时完成）；
+再在最优 (盘数, 总长度) 预算内按设备编号顺序 DFS，盘按编号顺序展开，
+首个完整方案即编号序列字典序最小者，配合容量、盘数 / 总长度预算剪枝与
+失败状态记忆化。
 """
 
 from __future__ import annotations
@@ -1423,3 +1435,247 @@ def solve_power_log_replay(
         )
 
     return PowerLogReplayResult(alerts=tuple(alerts), peak_loads=peak)
+
+
+# ---------------------------------------------------------------------------
+# 电缆盘裁切预演
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CableSegment:
+    """一台设备所需的一整段电缆（不可拼接）。"""
+
+    code: str  # 设备唯一编号
+    length: int  # 电缆段长度（正整数）
+
+
+@dataclass(frozen=True)
+class CableReel:
+    """一个库存电缆盘。"""
+
+    code: str  # 电缆盘唯一编号
+    length: int  # 电缆盘长度（正整数）
+
+
+@dataclass(frozen=True)
+class CableCut:
+    """某盘上裁给一台设备的一段电缆。"""
+
+    device_code: str  # 设备编号
+    length: int  # 电缆段长度（正整数）
+
+
+@dataclass(frozen=True)
+class CableReelPlan:
+    """单个启用盘的裁切清单。"""
+
+    reel_code: str  # 电缆盘编号
+    reel_length: int  # 电缆盘原长度
+    cuts: tuple[CableCut, ...]  # 裁切清单（按设备编号排序）
+    occupied: int  # 占用长度 = 段长之和 + (段数 - 1)·切割损耗
+    remaining: int  # 剩余长度 = 盘长 - 占用长度
+
+
+@dataclass(frozen=True)
+class CableCuttingResult:
+    """电缆盘裁切预演结果。feasible 为 False 时其余字段为 None。"""
+
+    feasible: bool
+    cut_loss: Optional[int]  # 每个相邻切口的切割损耗（非负整数）
+    assignment: Optional[dict[str, str]]  # 设备编号 -> 电缆盘编号
+    reel_plans: Optional[tuple[CableReelPlan, ...]]  # 各启用盘裁切清单（按盘编号排序）
+    reel_count: Optional[int]  # 启用盘数
+    reel_total_length: Optional[int]  # 启用盘总长度
+
+
+def solve_cable_cutting(
+    segments: Iterable[CableSegment],
+    reels: Iterable[CableReel],
+    cut_loss: int,
+) -> CableCuttingResult:
+    """求解电缆盘裁切预演。
+
+    每台设备需要一整段正整数长度电缆，不可拼接；同一盘裁出 k 段时占用长度为
+    「段长之和 + (k-1)·cut_loss」，不得超过盘长。目标依次为：
+    1) 启用盘数最少；2) 启用盘总长度最短；3) 按设备编号排序的电缆盘编号
+    序列字典序最小。
+
+    权值变换：令 w_i = 段长_i + cut_loss、C_j = 盘长_j + cut_loss，则盘 j 上
+    裁出段集合 S 可行 ⟺ Σ_{i∈S} w_i ≤ C_j，即标准的「每件整体放入一箱」
+    装箱问题（各箱容量可不同）。
+
+    求解分两步（设备、盘均不超过 8）：
+    - 逐盘 0/1 背包式子集划分 DP：reach[j][mask] 表示恰用前 j 个盘（每个盘
+      至多一次）能否裁出 mask 中的全部段，转移枚举第 j 个盘承接的非空
+      子集 sub ⊆ mask；记录最优 (启用盘数, 启用盘总长度)。
+    - 最优 (盘数, 总长度) 预算下，按设备编号排序逐段 DFS，盘按编号顺序
+      展开（先已启用且放得下的盘，再未启用的盘），首个完整方案即编号序列
+      字典序最小者；配合容量约束、盘数 / 总长度预算剪枝及失败状态记忆化。
+
+    :param segments: 电缆段集合（设备编号唯一、段长为正整数，不超过 8 段）。
+    :param reels: 库存电缆盘集合（编号唯一、盘长为正整数，不超过 8 个）。
+    :param cut_loss: 每个相邻切口的切割损耗（非负整数）。
+    :return: CableCuttingResult；无可行裁切方案时 feasible=False。
+    """
+    ordered_segments = sorted(segments, key=lambda s: s.code)
+    ordered_reels = sorted(reels, key=lambda r: r.code)
+    n = len(ordered_segments)
+    m = len(ordered_reels)
+    weights = [s.length + cut_loss for s in ordered_segments]
+    capacities = [r.length + cut_loss for r in ordered_reels]
+    reel_lengths = [r.length for r in ordered_reels]
+
+    size = 1 << n
+    full = size - 1
+
+    # subset_weight[mask]：子集内段的变换权值之和
+    subset_weight = [0] * size
+    for mask in range(1, size):
+        lsb = mask & (-mask)
+        i = lsb.bit_length() - 1
+        subset_weight[mask] = subset_weight[mask ^ lsb] + weights[i]
+
+    # 逐盘 0/1 背包式子集划分 DP：
+    # dp[mask] = 到达 mask 的最优 (启用盘数, 启用盘总长度)；None 为不可达。
+    dp: list[Optional[tuple[int, int]]] = [None] * size
+    dp[0] = (0, 0)
+    for j in range(m):
+        # 倒序更新保证每个盘至多使用一次；同一盘承接的段集合在 fit_masks[j]
+        # 内枚举（新增的 sub 与已有 mask 不相交时即取反方向的转移 mask|sub）
+        for mask in range(full, -1, -1):
+            current = dp[mask]
+            if current is None:
+                continue
+            remaining = full ^ mask
+            sub = remaining
+            while sub:
+                if subset_weight[sub] <= capacities[j]:
+                    candidate = (current[0] + 1, current[1] + reel_lengths[j])
+                    target = mask | sub
+                    if dp[target] is None or candidate < dp[target]:
+                        dp[target] = candidate
+                sub = (sub - 1) & remaining
+
+    best = dp[full]
+    if best is None:
+        return CableCuttingResult(
+            feasible=False,
+            cut_loss=cut_loss,
+            assignment=None,
+            reel_plans=None,
+            reel_count=None,
+            reel_total_length=None,
+        )
+    best_count, best_total = best
+
+    # 预算内按设备编号顺序 DFS 构造字典序最小方案。
+    # 状态：已处理前 i 段；loads[j] 为已放入盘 j 的变换权值和（未启用为 -1）。
+    # 所有盘严格按编号顺序展开（已启用盘与未启用盘交错比较），故首个满足
+    # 最优 (盘数, 总长度) 预算的完整方案即编号序列字典序最小者。
+    loads = [-1] * m
+    chosen: list[Optional[int]] = [None] * n
+    found: Optional[list[int]] = None
+    # 失败状态记忆化：(i, tuple(loads)) 无法在预算内补全；启用盘集合由 loads 决定
+    dead: set[tuple[int, tuple[int, ...]]] = set()
+
+    def dfs(i: int, used_count: int, used_total: int) -> None:
+        nonlocal found
+        if found is not None:
+            return
+        if i == n:
+            if used_count == best_count and used_total == best_total:
+                found = chosen.copy()
+            return
+        key = (i, tuple(loads))
+        if key in dead:
+            return
+        remaining_segments = n - i
+        # 盘数预算剪枝：最终启用盘数必在 [used_count, used_count + remaining]
+        if used_count > best_count:
+            dead.add(key)
+            return
+        # 总长度预算剪枝：后续即使不再启用新盘也已超总长
+        if used_total > best_total:
+            dead.add(key)
+            return
+        if used_count < best_count and used_count + remaining_segments < best_count:
+            # 剩余段每段至多新开一盘，仍凑不够最优盘数
+            dead.add(key)
+            return
+        w = weights[i]
+        # 所有盘严格按编号顺序尝试（已启用盘与未启用盘交错比较）：盘编号
+        # 序列按设备编号排序后逐位字典序比较，当前位置选编号更小的盘总是
+        # 占优（可行性 / 预算交由后续剪枝与回溯保证），故首个完整方案即
+        # 字典序最小者
+        for j in range(m):
+            if w > capacities[j]:
+                continue
+            if loads[j] >= 0:
+                # 放入已启用盘：不增加盘数与总长度
+                if loads[j] + w > capacities[j]:
+                    continue
+                loads[j] += w
+                chosen[i] = j
+                dfs(i + 1, used_count, used_total)
+                loads[j] -= w
+                chosen[i] = None
+            else:
+                # 启用一个新盘：受盘数 / 总长度预算约束
+                new_count = used_count + 1
+                new_total = used_total + reel_lengths[j]
+                if new_count > best_count or new_total > best_total:
+                    continue
+                if (
+                    new_count < best_count
+                    and new_count + (remaining_segments - 1) < best_count
+                ):
+                    # 剩余段每段至多再新开一盘，仍凑不够最优盘数
+                    continue
+                loads[j] = w
+                chosen[i] = j
+                dfs(i + 1, new_count, new_total)
+                loads[j] = -1
+                chosen[i] = None
+            if found is not None:
+                return
+        dead.add(key)
+
+    dfs(0, 0, 0)
+
+    assert found is not None  # DP 已证明可行，预算内必有完整方案
+
+    # 汇总各启用盘的裁切清单（按盘编号排序），占用 / 剩余长度按原口径计算
+    cuts_by_reel: dict[int, list[tuple[str, int]]] = {}
+    assignment: dict[str, str] = {}
+    for i, j in enumerate(found):
+        code = ordered_segments[i].code
+        assignment[code] = ordered_reels[j].code
+        cuts_by_reel.setdefault(j, []).append((code, ordered_segments[i].length))
+
+    reel_plans: list[CableReelPlan] = []
+    for j in sorted(cuts_by_reel, key=lambda idx: ordered_reels[idx].code):
+        cuts_tuple = tuple(
+            CableCut(device_code=code, length=length)
+            for code, length in sorted(cuts_by_reel[j])
+        )
+        occupied = sum(length for _, length in cuts_by_reel[j]) + cut_loss * (
+            len(cuts_by_reel[j]) - 1
+        )
+        reel_plans.append(
+            CableReelPlan(
+                reel_code=ordered_reels[j].code,
+                reel_length=reel_lengths[j],
+                cuts=cuts_tuple,
+                occupied=occupied,
+                remaining=reel_lengths[j] - occupied,
+            )
+        )
+    return CableCuttingResult(
+        feasible=True,
+        cut_loss=cut_loss,
+        assignment=assignment,
+        reel_plans=tuple(reel_plans),
+        reel_count=len(reel_plans),
+        reel_total_length=sum(reel_lengths[j] for j in cuts_by_reel),
+    )
